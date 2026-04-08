@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="3xui-bw-guard"
-VERSION="v7.4.1"
+VERSION="v7.4.2"
 APP_DIR="/etc/${APP_NAME}"
 CONF_FILE="${APP_DIR}/${APP_NAME}.conf"
 STATE_DIR="/run/${APP_NAME}"
@@ -369,13 +369,41 @@ setup_qdisc(){
   tc qdisc replace dev "$ifb" parent 2:999 fq_codel
 }
 
+detect_iface_safe(){
+  local d=""
+
+  if [[ -n "${IFACE:-}" && "${IFACE:-}" != "auto" ]]; then
+    [[ -d "/sys/class/net/${IFACE}" ]] && printf '%s
+' "$IFACE"
+    return 0
+  fi
+
+  d="$(ip -o route show default 2>/dev/null | awk '/default/ { for (i=1; i<=NF; i++) if ($i=="dev") { print $(i+1); exit } }' || true)"
+  if [[ -n "$d" && -d "/sys/class/net/$d" ]]; then
+    printf '%s
+' "$d"
+  fi
+
+  return 0
+}
+
 cleanup_qdisc(){
-  local iface ifb
-  iface="$(detect_iface 2>/dev/null || true)"
+  local iface="" ifb=""
+  iface="$(detect_iface_safe)"
   ifb="${INGRESS_IFB:-ifb3xui0}"
-  [[ -n "$iface" ]] && tc qdisc del dev "$iface" root 2>/dev/null || true
-  [[ -n "$iface" ]] && tc qdisc del dev "$iface" ingress 2>/dev/null || true
-  ip link show "$ifb" >/dev/null 2>&1 && tc qdisc del dev "$ifb" root 2>/dev/null || true
+
+  if [[ -n "$iface" ]]; then
+    tc qdisc del dev "$iface" ingress 2>/dev/null || true
+    tc qdisc del dev "$iface" root 2>/dev/null || true
+  fi
+
+  if ip link show "$ifb" >/dev/null 2>&1; then
+    tc qdisc del dev "$ifb" root 2>/dev/null || true
+    ip link set dev "$ifb" down 2>/dev/null || true
+    ip link delete "$ifb" type ifb 2>/dev/null || true
+  fi
+
+  return 0
 }
 
 cleanup_nft(){
@@ -662,10 +690,17 @@ reconcile_once(){
 }
 
 flush_runtime(){
-  rm -f "$STATE_DIR/clients.db" "$STATE_DIR/clients.db.tmp" "$STATE_DIR/attached.db" "$STATE_DIR/attached.db.tmp" \
-        "$STATE_DIR/seen.db" "$STATE_DIR/seen.db.tmp" "$STATE_DIR/last_gc"
-  cleanup_nft
-  cleanup_qdisc
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  rm -f "$STATE_DIR/clients.db" "$STATE_DIR/clients.db.tmp" "$STATE_DIR/attached.db" "$STATE_DIR/attached.db.tmp"         "$STATE_DIR/seen.db" "$STATE_DIR/seen.db.tmp" "$STATE_DIR/last_gc"
+  cleanup_nft || true
+  cleanup_qdisc || true
+}
+
+cmd_flush(){
+  need_root
+  load_config 2>/dev/null || true
+  flush_runtime
+  success "Flushed runtime shaping state"
 }
 
 stop_runtime(){
@@ -1010,7 +1045,7 @@ case "${1:-}" in
   doctor) cmd_doctor ;;
   wizard) cmd_wizard ;;
   logs) cmd_logs ;;
-  flush) flush_runtime ;;
+  flush) cmd_flush ;;
   run-daemon) run_daemon ;;
   stop-runtime) stop_runtime ;;
   *)
